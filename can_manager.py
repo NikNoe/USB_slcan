@@ -15,7 +15,7 @@ class CanManager(QWidget):
         self.timer.start(2000)
 
     def initUI(self):
-        self.setWindowTitle('CAN Manager - ThinkPad')
+        self.setWindowTitle('CAN Manager - TECNODJUM')
         self.setMinimumSize(400, 250)
         layout = QVBoxLayout()
         
@@ -45,35 +45,40 @@ class CanManager(QWidget):
         else:
             self.status_label.setText("❌ Aucun adaptateur détecté")
             self.device = None
-
+    
     def start_can(self):
         if not self.device:
-            QMessageBox.warning(self, "Erreur", "Branchez l'adaptateur d'abord !")
+            QMessageBox.warning(self, "Erreur", "Branchez l'adaptateur !")
             return
 
-        speed = self.combo.currentText().split('(')[1][:2]
+        # On récupère le code vitesse proprement, ex: "S6"
+        txt = self.combo.currentText()
+        speed_code = txt.split('(')[1][:2].lower() # donne "s6"
+
         try:
-            # Nettoyage
-            subprocess.run(["pkill", "-9", "slcand"])
+            # 1. On tue les anciens processus pour libérer le port
+            subprocess.run(["sudo", "pkill", "-9", "slcand"])
             time.sleep(0.5)
             
-            # Lancement de slcand (Attention à l'ordre des arguments)
-            cmd_slcan = ["slcand", "-o", "-c", "-f", f"-{speed}", "-s", speed, "-S", "3000000", self.device, "can0"]
-            subprocess.Popen(cmd_slcan) # Popen pour laisser le démon tourner
+            # 2. On lance slcand comme vous l'avez fait manuellement
+            # Note: -o (open), -c (close), -f (status), -s6 (vitesse CAN), -S (vitesse UART)
+            cmd = ["sudo", "slcand", "-o", "-c", "-f", f"-{speed_code}", "-S", "3000000", self.device, "can0"]
+            subprocess.run(cmd) 
             
-            time.sleep(1) # Attente cruciale pour que can0 apparaisse
+            time.sleep(1) # On laisse le temps au noyau de digérer
             
-            # Activation de l'interface
-            subprocess.run(["ip", "link", "set", "can0", "up"])
+            # 3. On active l'interface
+            subprocess.run(["sudo", "ip", "link", "set", "can0", "up"])
             
-            # Vérification finale
-            res = subprocess.run(["ip", "link", "show", "can0"], capture_output=True)
-            if b"UP" in res.stdout:
-                QMessageBox.information(self, "Succès", "Interface can0 est UP et prête !")
+            # 4. Vérification
+            check = subprocess.run(["ls", "/sys/class/net/"], capture_output=True, text=True)
+            if "can0" in check.stdout:
+                QMessageBox.information(self, "Succès", "can0 est en ligne ! SavvyCAN peut maintenant s'y connecter.")
             else:
-                QMessageBox.critical(self, "Erreur", "L'interface can0 n'a pas pu démarrer.")
+                QMessageBox.critical(self, "Erreur", "L'interface can0 n'apparaît toujours pas.")
+                
         except Exception as e:
-            QMessageBox.critical(self, "Erreur", str(e))
+            QMessageBox.critical(self, "Erreur", f"Crash: {str(e)}")
 
     def stop_can(self):
         subprocess.run(["ip", "link", "set", "can0", "down"])

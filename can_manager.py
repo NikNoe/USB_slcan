@@ -2,12 +2,15 @@ import sys
 import subprocess
 import os
 import time
-import can 
+import can
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QComboBox, QLabel, QTextEdit, QMessageBox)
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
 
-# --- Thread de lecture CAN pour ne pas bloquer l'interface ---
+# Identifiants CH341 standards
+CH341_VID = "1a86"
+CH341_PID = "7523"
+
 class CanReaderThread(QThread):
     message_received = pyqtSignal(object)
     error_signal = pyqtSignal(str)
@@ -25,157 +28,190 @@ class CanReaderThread(QThread):
                 if bus is None:
                     bus = can.interface.Bus(channel=self.interface, bustype='socketcan')
                 msg = bus.recv(timeout=0.5)
-                if msg:
-                    self.message_received.emit(msg)
-            except Exception as e:
-                self.error_signal.emit(str(e))
+                if msg: self.message_received.emit(msg)
+            except:
                 self.running = False
-        if bus:
-            bus.shutdown()
+        if bus: bus.shutdown()
 
-class CanManager(QWidget):
+class CanManagerV3(QWidget):
     def __init__(self):
-        # Chargement des pilotes au démarrage
-        subprocess.run(["sudo", "modprobe", "can", "can_raw", "slcan"])
         super().__init__()
         self.device = None
+        self.is_active = False # État souhaité par l'utilisateur
         self.can_thread = None
         self.msg_count = 0
+        
         self.initUI()
         
-        # Timers
+        # Timer de surveillance USB (Plus rapide pour l'auto-reconnexion)
         self.usb_timer = QTimer()
-        self.usb_timer.timeout.connect(self.check_usb)
-        self.usb_timer.start(2000)
-
-        self.load_timer = QTimer()
-        self.load_timer.timeout.connect(self.update_load)
-        self.load_timer.start(1000)
+        self.usb_timer.timeout.connect(self.monitor_usb_and_bus)
+        self.usb_timer.start(1000)
 
     def initUI(self):
-        self.setWindowTitle('CAN Manager - TECNODJUM Pro')
-        self.setMinimumSize(500, 400)
+        self.setWindowTitle('CAN Monitor Pro - TECNODJUM V3')
+        self.setMinimumSize(550, 500)
         layout = QVBoxLayout()
         
-        self.status_label = QLabel('🔍 Recherche du CH341...')
+        # Statut matériel
+        self.status_label = QLabel('🔍 En attente du CH341...')
+        self.status_label.setStyleSheet("font-weight: bold; color: orange;")
         layout.addWidget(self.status_label)
         
-        # Ligne Sélection et Activation
+        # État du Bus (Diagnostic)
+        self.bus_state_label = QLabel('État Bus: INCONNU')
+        self.bus_state_label.setStyleSheet("padding: 5px; background: #333; color: white;")
+        layout.addWidget(self.bus_state_label)
+
+        # Contrôles
         h_layout = QHBoxLayout()
         self.combo = QComboBox()
-        self.combo.addItems(["100k (S3)", "125k (S4)", "250k (S5)", "500k (S6)", "1M (S8)"])
+        self.combo.addItems(["500k (S6)", "100k (S3)","250k (S5)", "125k (S4)", "1M (S8)"])
         h_layout.addWidget(self.combo)
         
-        self.btn_connect = QPushButton('🚀 Activer CAN')
-        self.btn_connect.clicked.connect(self.start_can)
-        self.btn_connect.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold; padding: 8px;")
+        self.btn_connect = QPushButton('🚀 ACTIVER')
+        self.btn_connect.clicked.connect(self.toggle_activation)
+        self.btn_connect.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold; height: 30px;")
         h_layout.addWidget(self.btn_connect)
         layout.addLayout(h_layout)
 
-        # Zone Monitoring (LED et Messages/sec)
+        # Monitoring
         mon_layout = QHBoxLayout()
-        self.led = QLabel()
-        self.led.setFixedSize(15, 15)
+        self.led = QLabel(); self.led.setFixedSize(15, 15)
         self.led.setStyleSheet("background-color: gray; border-radius: 7px;")
         mon_layout.addWidget(self.led)
-        
         self.load_label = QLabel('Trafic: 0 msg/s')
         mon_layout.addWidget(self.load_label)
         layout.addLayout(mon_layout)
 
-        # Log des messages
+        # Logs
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: monospace;")
         layout.addWidget(self.log_view)
 
-        self.btn_stop = QPushButton('🛑 Arrêter CAN')
-        self.btn_stop.clicked.connect(self.stop_can)
-        layout.addWidget(self.btn_stop)
+        # Boutons d'action rapide
+        btn_layout = QHBoxLayout()
+        self.btn_reset = QPushButton('🔄 Reset Bus (Error Recovery)')
+        self.btn_reset.clicked.connect(self.reset_bus)
+        btn_layout.addWidget(self.btn_reset)
         
+        self.btn_clear = QPushButton('🧹 Effacer Log')
+        self.btn_clear.clicked.connect(lambda: self.log_view.clear())
+        btn_layout.addWidget(self.btn_clear)
+        layout.addLayout(btn_layout)
+
         self.setLayout(layout)
 
-    def check_usb(self):
-        ports = [f"/dev/{p}" for p in os.listdir('/dev') if p.startswith('ttyUSB')]
-        if ports:
-            self.device = ports[0]
-            if "Recherche" in self.status_label.text():
-                self.status_label.setText(f"✅ Adaptateur trouvé : {self.device}")
-        else:
-            self.status_label.setText("❌ Aucun adaptateur détecté")
-            self.device = None
-
-    def start_can(self):
-        if not self.device:
-            QMessageBox.warning(self, "Erreur", "Aucun adaptateur USB détecté !")
-            return
-
-        speed = self.combo.currentText().split('(')[1][:2].lower()
-        
+    def find_ch341(self):
+        """Identifie précisément le CH341 via ses IDs USB"""
         try:
-            self.log_view.append("🔄 Nettoyage et configuration...")
-            subprocess.run(["sudo", "pkill", "-9", "slcand"])
-            subprocess.run(["sudo", "ip", "link", "set", "can0", "down"], stderr=subprocess.DEVNULL)
-            time.sleep(0.5)
-            
-            # Utilisation de 115200 baud pour la stabilité série du CH341
-            cmd = ["sudo", "slcand", "-o", "-c", "-f", f"-{speed}", "-S", "115200", self.device, "can0"]
-            subprocess.Popen(cmd) 
-            
-            time.sleep(2.0) 
-            
-            # Activation
-            res = subprocess.run(["sudo", "ip", "link", "set", "can0", "up", "txqueuelen", "1000"], capture_output=True)
-            
-            if res.returncode == 0:
-                self.log_view.append("✅ can0 est UP !")
-                self.start_monitoring()
-            else:
-                self.log_view.append("❌ Erreur: L'interface n'a pas pu démarrer.")
-                
-        except Exception as e:
-            self.log_view.append(f"❌ Erreur: {str(e)}")
+            import pyudev
+            context = pyudev.Context()
+            for device in context.list_devices(subsystem='tty'):
+                if 'ID_VENDOR_ID' in device and device.get('ID_VENDOR_ID') == CH341_VID:
+                    return device.device_node
+        except ImportError:
+            # Fallback si pyudev n'est pas installé
+            ports = [f"/dev/{p}" for p in os.listdir('/dev') if p.startswith('ttyUSB')]
+            return ports[0] if ports else None
+        return None
 
-    def start_monitoring(self):
-        if self.can_thread and self.can_thread.isRunning():
-            self.can_thread.stop()
+    def monitor_usb_and_bus(self):
+        current_dev = self.find_ch341()
         
+        # 1. Gestion de la présence USB
+        if current_dev:
+            self.device = current_dev
+            self.status_label.setText(f"✅ CH341 détecté sur {self.device}")
+            self.status_label.setStyleSheet("color: #2ecc71;")
+            
+            # AUTO-RECONNEXION : Si l'utilisateur voulait que ce soit actif mais que ça ne l'est pas
+            if self.is_active and not self.is_interface_up():
+                self.log_view.append("🔄 Reconnexion automatique en cours...")
+                self.start_can_logic()
+        else:
+            if self.device: # Vient d'être débranché
+                self.log_view.append("⚠️ USB Débranché !")
+                self.stop_can_logic()
+            self.device = None
+            self.status_label.setText("❌ CH341 non trouvé")
+            self.status_label.setStyleSheet("color: red;")
+
+        # 2. Diagnostic de l'état du Bus
+        if self.is_interface_up():
+            self.update_bus_status()
+
+    def is_interface_up(self):
+        res = subprocess.run(["ip", "link", "show", "can0"], capture_output=True, text=True)
+        return "UP" in res.stdout and "LOWER_UP" in res.stdout
+
+    def update_bus_status(self):
+        try:
+            res = subprocess.run(["ip", "-details", "-statistics", "link", "show", "can0"], 
+                                 capture_output=True, text=True)
+            output = res.stdout
+            if "ERROR-PASSIVE" in output: state = "⚠️ ERROR-PASSIVE"; col = "orange"
+            elif "BUS-OFF" in output: state = "🛑 BUS-OFF"; col = "red"
+            elif "ERROR-ACTIVE" in output: state = "🟢 ERROR-ACTIVE (Normal)"; col = "#2ecc71"
+            else: state = "OK"; col = "white"
+            self.bus_state_label.setText(f"État Bus: {state}")
+            self.bus_state_label.setStyleSheet(f"background: #222; color: {col}; padding: 5px;")
+        except: pass
+
+    def toggle_activation(self):
+        if not self.is_active:
+            self.is_active = True
+            self.start_can_logic()
+            self.btn_connect.setText("🛑 DÉSACTIVER")
+            self.btn_connect.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        else:
+            self.is_active = False
+            self.stop_can_logic()
+            self.btn_connect.setText("🚀 ACTIVER")
+            self.btn_connect.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold;")
+
+    def start_can_logic(self):
+        if not self.device: return
+        speed = self.combo.currentText().split('(')[1][:2].lower()
+        subprocess.run(["sudo", "pkill", "-9", "slcand"])
+        time.sleep(0.2)
+        subprocess.run(["sudo", "modprobe", "can", "can_raw", "slcan"])
+        cmd = ["sudo", "slcand", "-o", "-c", "-f", f"-{speed}", "-S", "115200", self.device, "can0"]
+        subprocess.Popen(cmd)
+        time.sleep(1.5)
+        subprocess.run(["sudo", "ip", "link", "set", "can0", "up", "txqueuelen", "1000"])
+        
+        # Lancer thread de lecture
         self.can_thread = CanReaderThread('can0')
         self.can_thread.message_received.connect(self.process_msg)
-        self.can_thread.error_signal.connect(lambda e: self.log_view.append(f"⚠️ Bus Error: {e}"))
         self.can_thread.start()
+
+    def stop_can_logic(self):
+        if self.can_thread: self.can_thread.running = False
+        subprocess.run(["sudo", "ip", "link", "set", "can0", "down"], stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "pkill", "slcand"], stderr=subprocess.DEVNULL)
+
+    def reset_bus(self):
+        self.log_view.append("♻️ Réinitialisation du Bus CAN...")
+        self.stop_can_logic()
+        time.sleep(1)
+        if self.is_active: self.start_can_logic()
 
     def process_msg(self, msg):
         self.msg_count += 1
-        # Faire clignoter la LED
         self.led.setStyleSheet("background-color: #00ff00; border-radius: 7px;")
         QTimer.singleShot(100, lambda: self.led.setStyleSheet("background-color: #008800; border-radius: 7px;"))
-        
-        # Affichage simplifié dans le log
         data_hex = ' '.join([f"{b:02X}" for b in msg.data])
-        self.log_view.append(f"ID: {msg.arbitration_id:03X} | Data: {data_hex}")
-        
-        # Limiter le nombre de lignes pour ne pas ralentir l'app
-        cursor = self.log_view.textCursor()
-        if self.log_view.document().blockCount() > 50:
-            cursor.movePosition(cursor.MoveOperation.Start)
-            cursor.select(cursor.SelectionType.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
+        self.log_view.append(f"ID: {msg.arbitration_id:03X} | {data_hex}")
+        if self.log_view.document().blockCount() > 50: self.log_view.clear()
 
     def update_load(self):
         self.load_label.setText(f"Trafic: {self.msg_count} msg/s")
         self.msg_count = 0
 
-    def stop_can(self):
-        if self.can_thread:
-            self.can_thread.running = False
-        subprocess.run(["sudo", "ip", "link", "set", "can0", "down"])
-        subprocess.run(["sudo", "pkill", "slcand"])
-        self.log_view.append("🛑 Interface can0 arrêtée.")
-
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    ex = CanManager()
+    ex = CanManagerV3()
     ex.show()
     sys.exit(app.exec())
